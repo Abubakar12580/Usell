@@ -61,5 +61,13 @@ export function createSeed() {
     createdAt: ago(i % 14, i % 20), meta: {}
   }));
 
-  return { version: 1, users, listings, conversations, events, supportLogs: [], messages: [], newsletter: [], contactMessages: [], reports: [] };
+  const includeSamples = demoMode || process.env.SEED_SAMPLE_DATA === 'true';
+  return {
+    version: 1,
+    users: includeSamples ? users : users.filter((user) => user.role === 'admin'),
+    listings: includeSamples ? listings : [],
+    conversations: includeSamples ? conversations : [],
+    events: includeSamples ? events : [],
+    supportLogs: [], messages: [], newsletter: [], contactMessages: [], reports: []
+  };
 }

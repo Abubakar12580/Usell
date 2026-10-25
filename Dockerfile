@@ -11,10 +11,11 @@ COPY . .
 RUN npm run build && npm prune --omit=dev
 
 ENV NODE_ENV=production
-ENV PORT=5173
-EXPOSE 5173
+ENV PORT=10000
+EXPOSE 10000
 
-# Mount a persistent volume at /data in your hosting dashboard.
-# Set USELL_DB_PATH=/data/db.json and USELL_UPLOAD_DIR=/data/uploads.
+# Public deployments use external durable services:
+# PostgreSQL via DATABASE_URL and permanent images via Cloudinary.
+# No paid persistent disk is required on Render.
 
 CMD ["npm", "start"]

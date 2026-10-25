@@ -4,20 +4,33 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
+import rateLimit from 'express-rate-limit';
+import { v2 as cloudinary } from 'cloudinary';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { initStore, getDb, saveDb, publicUser, addEvent } from './store.js';
+import { initStore, getDb, saveDb, publicUser, addEvent, storageMode } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const uploadDir = process.env.USELL_UPLOAD_DIR ? path.resolve(process.env.USELL_UPLOAD_DIR) : path.join(root, 'public', 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
-if (process.env.DEMO_MODE === 'false' && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
-  throw new Error('Public mode requires a JWT_SECRET with at least 32 characters.');
+const cloudinaryEnabled = Boolean(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+if (cloudinaryEnabled) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
+  });
 }
-initStore();
+if (process.env.DEMO_MODE === 'false') {
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('Public mode requires a JWT_SECRET with at least 32 characters.');
+  if (!process.env.DATABASE_URL) throw new Error('Public mode requires DATABASE_URL so customer data is never stored on temporary hosting disks.');
+  if (!cloudinaryEnabled) throw new Error('Public mode requires Cloudinary credentials so uploaded photos are permanent.');
+}
+await initStore();
 
 const app = express();
 const PORT = Number(process.env.PORT || 5173);
@@ -26,9 +39,20 @@ const ADMIN_WHATSAPP = process.env.ADMIN_WHATSAPP || '+923347323999';
 const id = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 const now = () => new Date().toISOString();
 
-app.use(cors());
+app.set('trust proxy', 1);
+app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : false }));
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 1000, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please wait a few minutes and try again.' } }));
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many account attempts. Please wait before trying again.' } }));
+app.use('/api/support/chat', rateLimit({ windowMs: 60 * 60 * 1000, limit: 60, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Support chat limit reached. Please try again later.' } }));
 app.use('/uploads', express.static(uploadDir, { maxAge: '7d' }));
 app.use('/images', express.static(path.join(root, 'public', 'images'), { maxAge: '7d' }));
 
@@ -82,7 +106,7 @@ function conversationWithMeta(conversation, userId) {
 }
 
 // Health and marketplace metadata
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'Usell marketplace', time: now() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'Usell marketplace', database: storageMode(), imageStorage: cloudinaryEnabled ? 'cloudinary' : 'local', time: now() }));
 app.get('/api/meta', (_req, res) => res.json({
   categories: ['Women', 'Men', 'Traditional', 'Shoes', 'Bags', 'Accessories'],
   conditions: ['New with tags', 'Like new', 'Excellent', 'Good', 'Fair'],
@@ -105,8 +129,8 @@ app.post('/api/auth/register', async (req, res) => {
     whatsapp: '', avatar: '', verified: false, role: 'user', joinedAt: now(), bio: ''
   };
   db.users.push(user);
-  saveDb();
-  addEvent('signup', { userId: user.id });
+  await saveDb();
+  await addEvent('signup', { userId: user.id });
   res.status(201).json({ token: sign(user), user: publicUser(user, true) });
 });
 
@@ -114,18 +138,18 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   const user = getDb().users.find((u) => u.email.toLowerCase() === (email || '').toLowerCase().trim());
   if (!user || !(await bcrypt.compare(password || '', user.passwordHash))) return res.status(401).json({ error: 'Email or password is incorrect.' });
-  addEvent('login', { userId: user.id });
+  await addEvent('login', { userId: user.id });
   res.json({ token: sign(user), user: publicUser(user, true) });
 });
 
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user, true) }));
-app.patch('/api/auth/me', auth, (req, res) => {
+app.patch('/api/auth/me', auth, async (req, res) => {
   const allowed = ['name', 'location', 'bio', 'whatsapp'];
   allowed.forEach((key) => {
     if (typeof req.body[key] === 'string') req.user[key] = req.body[key].trim().slice(0, key === 'bio' ? 300 : 120);
   });
   if (!req.user.name) return res.status(400).json({ error: 'Name cannot be empty.' });
-  saveDb();
+  await saveDb();
   res.json({ user: publicUser(req.user, true) });
 });
 
@@ -136,7 +160,7 @@ app.get('/api/users/:userId', (req, res) => {
   res.json({ user: publicUser(user) });
 });
 
-app.get('/api/listings', optionalAuth, (req, res) => {
+app.get('/api/listings', optionalAuth, async (req, res) => {
   const db = getDb();
   const { q = '', category = '', condition = '', size = '', city = '', minPrice, maxPrice, sort = 'newest', owner = '', featured = '', limit = '60' } = req.query;
   let items = db.listings.filter((listing) => listing.status === 'active');
@@ -165,16 +189,16 @@ app.get('/api/listings', optionalAuth, (req, res) => {
   items.sort(sorters[sort] || sorters.newest);
   const total = items.length;
   items = items.slice(0, Math.min(Number(limit) || 60, 100)).map((listing) => listingWithMeta(listing, req.user));
-  if (q) addEvent('search', { userId: req.user?.id, meta: { query: String(q).slice(0, 100), results: total } });
+  if (q) await addEvent('search', { userId: req.user?.id, meta: { query: String(q).slice(0, 100), results: total } });
   res.json({ listings: items, total });
 });
 
-app.get('/api/listings/:listingId', optionalAuth, (req, res) => {
+app.get('/api/listings/:listingId', optionalAuth, async (req, res) => {
   const listing = getDb().listings.find((item) => item.id === req.params.listingId && item.status !== 'removed');
   if (!listing) return res.status(404).json({ error: 'This listing is no longer available.' });
   listing.views = (listing.views || 0) + 1;
-  saveDb();
-  addEvent('listing_view', { userId: req.user?.id, listingId: listing.id });
+  await saveDb();
+  await addEvent('listing_view', { userId: req.user?.id, listingId: listing.id });
   const similar = getDb().listings.filter((item) => item.id !== listing.id && item.status === 'active' && item.category === listing.category).slice(0, 4).map((item) => listingWithMeta(item, req.user));
   res.json({ listing: listingWithMeta(listing, req.user), similar });
 });
@@ -189,7 +213,34 @@ const upload = multer({
   fileFilter: (_req, file, cb) => cb(file.mimetype.startsWith('image/') ? null : new Error('Only image files are allowed.'), file.mimetype.startsWith('image/'))
 });
 
-app.post('/api/listings', auth, upload.array('images', 5), (req, res) => {
+function removeTempFiles(files = []) {
+  files.forEach((file) => { if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); });
+}
+
+async function storeListingImages(files, ownerId) {
+  if (!cloudinaryEnabled) return { urls: files.map((file) => `/uploads/${file.filename}`), publicIds: [] };
+  const uploaded = [];
+  try {
+    for (const file of files) {
+      const result = await cloudinary.uploader.upload(file.path, {
+        folder: process.env.CLOUDINARY_FOLDER || 'usell/listings',
+        public_id: `${ownerId}-${crypto.randomUUID()}`,
+        resource_type: 'image',
+        overwrite: false,
+        transformation: [{ width: 1600, height: 2000, crop: 'limit', quality: 'auto', fetch_format: 'auto' }]
+      });
+      uploaded.push({ url: result.secure_url, publicId: result.public_id });
+    }
+    return { urls: uploaded.map((item) => item.url), publicIds: uploaded.map((item) => item.publicId) };
+  } catch (error) {
+    await Promise.allSettled(uploaded.map((item) => cloudinary.uploader.destroy(item.publicId)));
+    throw error;
+  } finally {
+    removeTempFiles(files);
+  }
+}
+
+app.post('/api/listings', auth, upload.array('images', 5), async (req, res) => {
   const { title, description, category, subcategory = '', brand = '', size, condition, color = '', price, originalPrice = '', location, shipping = 'Nationwide delivery' } = req.body;
   if (!title?.trim() || !description?.trim() || !category || !size || !condition || !location?.trim()) {
     req.files?.forEach((file) => fs.unlinkSync(file.path));
@@ -200,21 +251,28 @@ app.post('/api/listings', auth, upload.array('images', 5), (req, res) => {
     return res.status(400).json({ error: 'Please enter a valid price.' });
   }
   if (!req.files?.length) return res.status(400).json({ error: 'Add at least one clear photo of your item.' });
+  let uploadedImages;
+  try {
+    uploadedImages = await storeListingImages(req.files, req.user.id);
+  } catch (error) {
+    console.error('Cloudinary upload failed:', error);
+    return res.status(502).json({ error: 'The photo storage service could not save your images. Please try again.' });
+  }
   const db = getDb();
   const listing = {
     id: id('l'), ownerId: req.user.id, title: title.trim().slice(0, 90), description: description.trim().slice(0, 1500),
     category, subcategory: subcategory.trim(), brand: brand.trim().slice(0, 60), size, condition,
     color: color.trim().slice(0, 50), price: Number(price), originalPrice: Number(originalPrice) || null,
-    images: req.files.map((file) => `/uploads/${file.filename}`), location: location.trim().slice(0, 100),
+    images: uploadedImages.urls, imagePublicIds: uploadedImages.publicIds, location: location.trim().slice(0, 100),
     country: 'Pakistan', shipping, status: 'active', featured: false, views: 0, likedBy: [], createdAt: now(), updatedAt: now()
   };
   db.listings.unshift(listing);
-  saveDb();
-  addEvent('listing_created', { userId: req.user.id, listingId: listing.id });
+  await saveDb();
+  await addEvent('listing_created', { userId: req.user.id, listingId: listing.id });
   res.status(201).json({ listing: listingWithMeta(listing, req.user) });
 });
 
-app.patch('/api/listings/:listingId', auth, (req, res) => {
+app.patch('/api/listings/:listingId', auth, async (req, res) => {
   const listing = getDb().listings.find((item) => item.id === req.params.listingId);
   if (!listing || listing.ownerId !== req.user.id) return res.status(404).json({ error: 'Listing not found in your account.' });
   const allowed = ['title', 'description', 'price', 'originalPrice', 'condition', 'size', 'location', 'shipping', 'status'];
@@ -223,30 +281,34 @@ app.patch('/api/listings/:listingId', auth, (req, res) => {
   });
   if (!['active', 'sold', 'draft'].includes(listing.status)) return res.status(400).json({ error: 'Invalid listing status.' });
   listing.updatedAt = now();
-  saveDb();
-  addEvent('listing_updated', { userId: req.user.id, listingId: listing.id, meta: { status: listing.status } });
+  await saveDb();
+  await addEvent('listing_updated', { userId: req.user.id, listingId: listing.id, meta: { status: listing.status } });
   res.json({ listing: listingWithMeta(listing, req.user) });
 });
 
-app.delete('/api/listings/:listingId', auth, (req, res) => {
+app.delete('/api/listings/:listingId', auth, async (req, res) => {
   const db = getDb();
   const listing = db.listings.find((item) => item.id === req.params.listingId);
   if (!listing || listing.ownerId !== req.user.id) return res.status(404).json({ error: 'Listing not found in your account.' });
   listing.status = 'removed';
   listing.updatedAt = now();
-  saveDb();
-  addEvent('listing_removed', { userId: req.user.id, listingId: listing.id });
+  await saveDb();
+  await addEvent('listing_removed', { userId: req.user.id, listingId: listing.id });
+  if (cloudinaryEnabled && listing.imagePublicIds?.length) {
+    const results = await Promise.allSettled(listing.imagePublicIds.map((publicId) => cloudinary.uploader.destroy(publicId)));
+    results.filter((result) => result.status === 'rejected').forEach((result) => console.error('Cloudinary cleanup:', result.reason));
+  }
   res.json({ ok: true });
 });
 
-app.post('/api/listings/:listingId/favorite', auth, (req, res) => {
+app.post('/api/listings/:listingId/favorite', auth, async (req, res) => {
   const listing = getDb().listings.find((item) => item.id === req.params.listingId && item.status === 'active');
   if (!listing) return res.status(404).json({ error: 'Listing not found.' });
   listing.likedBy ||= [];
   const exists = listing.likedBy.includes(req.user.id);
   listing.likedBy = exists ? listing.likedBy.filter((userId) => userId !== req.user.id) : [...listing.likedBy, req.user.id];
-  saveDb();
-  if (!exists) addEvent('favourite', { userId: req.user.id, listingId: listing.id });
+  await saveDb();
+  if (!exists) await addEvent('favourite', { userId: req.user.id, listingId: listing.id });
   res.json({ isFavorite: !exists, favoriteCount: listing.likedBy.length });
 });
 
@@ -264,7 +326,7 @@ app.get('/api/conversations', auth, (req, res) => {
   res.json({ conversations });
 });
 
-app.post('/api/conversations', auth, (req, res) => {
+app.post('/api/conversations', auth, async (req, res) => {
   const { listingId, message } = req.body;
   const db = getDb();
   const listing = db.listings.find((item) => item.id === listingId && item.status === 'active');
@@ -277,28 +339,28 @@ app.post('/api/conversations', auth, (req, res) => {
     db.conversations.push(conversation);
   }
   conversation.messages.push({ id: id('m'), senderId: req.user.id, text: message.trim().slice(0, 1000), createdAt: now(), readBy: [req.user.id] });
-  saveDb();
-  addEvent('message', { userId: req.user.id, listingId: listing.id });
+  await saveDb();
+  await addEvent('message', { userId: req.user.id, listingId: listing.id });
   res.status(201).json({ conversation: conversationWithMeta(conversation, req.user.id) });
 });
 
-app.get('/api/conversations/:conversationId', auth, (req, res) => {
+app.get('/api/conversations/:conversationId', auth, async (req, res) => {
   const conversation = getDb().conversations.find((item) => item.id === req.params.conversationId && item.participants.includes(req.user.id));
   if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
   conversation.messages.forEach((message) => {
     if (!message.readBy.includes(req.user.id)) message.readBy.push(req.user.id);
   });
-  saveDb();
+  await saveDb();
   res.json({ conversation: conversationWithMeta(conversation, req.user.id) });
 });
 
-app.post('/api/conversations/:conversationId/messages', auth, (req, res) => {
+app.post('/api/conversations/:conversationId/messages', auth, async (req, res) => {
   const conversation = getDb().conversations.find((item) => item.id === req.params.conversationId && item.participants.includes(req.user.id));
   if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
   if (!req.body.message?.trim()) return res.status(400).json({ error: 'Message cannot be empty.' });
   conversation.messages.push({ id: id('m'), senderId: req.user.id, text: req.body.message.trim().slice(0, 1000), createdAt: now(), readBy: [req.user.id] });
-  saveDb();
-  addEvent('message', { userId: req.user.id, listingId: conversation.listingId });
+  await saveDb();
+  await addEvent('message', { userId: req.user.id, listingId: conversation.listingId });
   res.status(201).json({ conversation: conversationWithMeta(conversation, req.user.id) });
 });
 
@@ -354,8 +416,8 @@ app.post('/api/support/chat', optionalAuth, async (req, res) => {
     } catch { result = { ...localGuide(message), source: 'guide' }; }
   } else result = { ...localGuide(message), source: 'guide' };
   getDb().supportLogs.push({ id: id('support'), userId: req.user?.id || null, message, answer: result.answer, createdAt: now() });
-  saveDb();
-  addEvent('support_chat', { userId: req.user?.id });
+  await saveDb();
+  await addEvent('support_chat', { userId: req.user?.id });
   res.json(result);
 });
 
@@ -387,7 +449,7 @@ function analyticsSnapshot() {
     generatedAt: now(),
     metrics: { totalUsers: db.users.filter((u) => u.role !== 'admin').length, activeListings: active.length, soldListings: db.listings.filter((l) => l.status === 'sold').length, totalViews, totalFavourites, conversations: db.conversations.length, newUsers7d: newUsers.length, supportQuestions: db.supportLogs.length },
     categoryCounts, days, suggestions,
-    recentUsers: [...db.users].filter((u) => u.role !== 'admin').sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)).slice(0, 6).map(publicUser),
+    recentUsers: [...db.users].filter((u) => u.role !== 'admin').sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)).slice(0, 6).map((member) => publicUser(member)),
     recentListings: [...active].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 6).map((l) => ({ id: l.id, title: l.title, price: l.price, category: l.category, images: l.images, views: l.views, createdAt: l.createdAt })),
     whatsapp: { configured: Boolean(process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID), recipient: `${ADMIN_WHATSAPP.slice(0, 5)}•••••${ADMIN_WHATSAPP.slice(-3)}` }
   };
@@ -428,35 +490,38 @@ app.post('/api/admin/whatsapp-report', auth, adminOnly, async (req, res) => {
   try {
     const result = await deliverWhatsApp(report);
     getDb().reports.push({ id: id('r'), createdAt: now(), sent: result.sent, requestedBy: req.user.id });
-    saveDb();
-    addEvent('analytics_report', { userId: req.user.id, meta: { sent: result.sent } });
+    await saveDb();
+    await addEvent('analytics_report', { userId: req.user.id, meta: { sent: result.sent } });
     res.json({ ...result, report, whatsappLink: `https://wa.me/${ADMIN_WHATSAPP.replace(/\D/g, '')}?text=${encodeURIComponent(report)}`, message: result.sent ? 'Report delivered to WhatsApp.' : 'Report generated. Add Meta WhatsApp Cloud API credentials on the server to enable automatic delivery.' });
   } catch (error) { res.status(502).json({ error: error.message, report }); }
 });
 
 // Newsletter and contact
-app.post('/api/newsletter', (req, res) => {
+app.post('/api/newsletter', async (req, res) => {
   if (!emailOk(req.body.email)) return res.status(400).json({ error: 'Please enter a valid email address.' });
   const db = getDb();
   if (!db.newsletter.some((item) => item.email === req.body.email.toLowerCase())) db.newsletter.push({ id: id('n'), email: req.body.email.toLowerCase(), createdAt: now() });
-  saveDb();
+  await saveDb();
   res.status(201).json({ message: 'You’re on the list. Welcome to the Usell community!' });
 });
-app.post('/api/contact', (req, res) => {
+app.post('/api/contact', async (req, res) => {
   const { name, email, message } = req.body;
   if (!name?.trim() || !emailOk(email) || !message?.trim()) return res.status(400).json({ error: 'Please complete your name, email and message.' });
   getDb().contactMessages.push({ id: id('contact'), name: name.trim(), email: email.trim(), message: message.trim().slice(0, 1500), createdAt: now() });
-  saveDb();
+  await saveDb();
   res.status(201).json({ message: 'Thanks — your message has been sent to the Usell team.' });
 });
-app.post('/api/analytics/event', optionalAuth, (req, res) => {
-  if (['page_view', 'sell_started'].includes(req.body.type)) addEvent(req.body.type, { userId: req.user?.id, meta: { path: String(req.body.path || '').slice(0, 150) } });
+app.post('/api/analytics/event', optionalAuth, async (req, res) => {
+  if (['page_view', 'sell_started'].includes(req.body.type)) await addEvent(req.body.type, { userId: req.user?.id, meta: { path: String(req.body.path || '').slice(0, 150) } });
   res.json({ ok: true });
 });
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(400).json({ error: error.message || 'Something went wrong. Please try again.' });
+  const clientError = error.name === 'MulterError' || error.type === 'entity.parse.failed' || error.message === 'Only image files are allowed.';
+  res.status(clientError ? 400 : 500).json({
+    error: clientError ? error.message : 'We could not complete that securely. Please try again.',
+  });
 });
 
 // Vite middleware in development; the same Express app serves the built app in production.
